@@ -113,6 +113,7 @@ except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
 from agent.telemetry import RecordingGatewayContext, Telemetry
+from agent.strategy import cheap_mask, is_catalog_trap, pick_replica, successor_of
 
 __all__ = [
     "COMMAND_KINDS",
@@ -362,66 +363,111 @@ class Gateway:
         decide is already sitting in `cmd` and `self.ctx`.
 
         This starter forwards EVERYTHING it is handed, unmodified, and
-        denies NOTHING — see the module docstring's "THE STARTER'S SHAPE".
-        The four jobs below are named, ordered, and commented; none of them
-        currently changes the outcome."""
+        The four jobs below are implemented: ROUTE, ADMIT, AUTHORIZE, BUDGET."""
         self._telemetry.decision_seen(cmd)
 
-        # ------------------------------------------------------------------
-        # JOB 1 — ROUTE: is this the right SERVER/REPLICA for this command?
-        # TODO(you): day18-style drift is real and measured (CORPUS-FACTS.md
-        # section 2) — a `swap_replica` mutation (CONTRACTS.md section 8's
-        # closed mutation-op set) can point `cmd` at a stale replica without
-        # the model ever noticing. `agent/strategy.py`'s replica-choice
-        # helper is where this heuristic belongs; wire its answer in here by
-        # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
-        # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        is_rewritten = False
+        new_server = cmd.server
+        new_tool = cmd.tool
+        new_fields = cmd.fields
+        new_headers = dict(cmd.headers)
 
         # ------------------------------------------------------------------
-        # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
-        # it costs anything?
-        # TODO(you): a call you already KNOW is doomed (no live lease in
-        # `self.ctx.leases` for a `get_frame`, a write with no realistic
-        # chance of a matching `If-Match`, a call that already 409'd once
-        # this duel and nothing has changed) is a candidate to DENY here —
-        # and remember, `verdict="deny"` costs the caller ZERO credits
-        # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
-        # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
+        # JOB 1 — ROUTE: Server, tool, and replica routing
+        # Check tool deprecation (e.g. slides.search -> slides.query)
+        succ = successor_of(cmd.server, cmd.tool)
+        if succ is not None:
+            new_server, new_tool = succ
+            is_rewritten = True
+
+        # Replica choice for slides
+        if new_server == "slides" and "mcp-replica" not in new_headers:
+            path_id = cmd.args.get("path_id")
+            choice = pick_replica(path_id=path_id, known_drifting=False)
+            new_headers["mcp-replica"] = choice.replica
+            is_rewritten = True
 
         # ------------------------------------------------------------------
-        # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
-        # TODO(you): a write whose target learner id != `self.ctx.act`, or a
-        # scope this call needs that `self.ctx.scopes` never granted, is the
-        # `authority_exceeded` class (CONTRACTS.md section 6.4) — the
-        # single heaviest-weighted class in the whole rubric (weight 10,
-        # tied with `enforcement_failure`) precisely because it is what
-        # Day 26's own thesis is about: what your infrastructure enforced,
-        # not what your agent happened to say. `kit/mcp/a2a.py`'s
-        # `verify_delegation` is the real worked example of an authority
-        # check over a signed token, for the A2A-specific version of this
-        # same job.
-        # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
-        # this is a real hole, left open on purpose for you to close.
+        # JOB 2 — ADMIT: Is this call valid to let through?
+        # Check get_frame lease requirement
+        if new_tool == "get_frame":
+            if not cmd.lease_id or cmd.lease_id not in self.ctx.leases:
+                return self.deny(cmd, reason="admit: get_frame requires a live lease in ctx.leases")
+
+        # Check write commands for If-Match / Idempotency-Key headers
+        is_write = new_tool in ("record_mastery", "update_progress", "write") or "progress" in new_server
+        if is_write:
+            has_if_match = any(k.lower() == "if-match" for k in new_headers)
+            has_idem = any(k.lower() == "idempotency-key" for k in new_headers)
+            if not has_if_match and not has_idem:
+                return self.deny(cmd, reason="admit: write command requires If-Match or Idempotency-Key header")
+            
+            # Check duplicate idempotency key
+            idem_val = next((v for k, v in new_headers.items() if k.lower() == "idempotency-key"), None)
+            if idem_val:
+                if hasattr(self, "_seen_idem_keys"):
+                    if idem_val in self._seen_idem_keys:
+                        return self.deny(cmd, reason=f"admit: reused idempotency key {idem_val!r}")
+                    self._seen_idem_keys.add(idem_val)
+                else:
+                    self._seen_idem_keys = {idem_val}
 
         # ------------------------------------------------------------------
-        # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
-        # actually afford `routed` as written?
-        # TODO(you): `fields=("*",)` on `registry.list_servers` or
-        # `glossary.list_terms` is a "punishment button" (FINAL-PLAN.md
-        # section 4.1) that alone can exceed a whole round's sustainable
-        # allowance — see agent/strategy.py's own arithmetic in its module
-        # docstring: a disciplined round costs about 8-11 credits against a
-        # pool of 100 for the WHOLE duel; a careless one costs about 49 and
-        # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
-        # REWRITE `routed.fields` down to the tool's cheap default instead
-        # of forwarding the expensive mask verbatim.
-        # starter: never rewrites a mask and never paces spend — it trusts
-        # the model's own field mask exactly as written, every time.
+        # JOB 3 — AUTHORIZE: Does `cmd` belong to whom we serve? (ctx.act and ctx.scopes)
+        # Check target learner / act match
+        target_learner = cmd.args.get("learner") or cmd.args.get("act")
+        if target_learner and isinstance(target_learner, str):
+            if target_learner.lower() != self.ctx.act.lower():
+                return self.deny(
+                    cmd,
+                    reason=f"authorize: target learner {target_learner!r} does not match ctx.act {self.ctx.act!r}"
+                )
+
+        # Check audience claim on A2A token / headers
+        target_aud = new_headers.get("aud") or cmd.args.get("aud")
+        if target_aud and isinstance(target_aud, str):
+            if target_aud.lower() != new_server.lower() and f"a2a:{new_server.lower()}" != target_aud.lower():
+                return self.deny(cmd, reason=f"authorize: audience {target_aud!r} does not match target peer {new_server!r}")
+
+        # Check write scopes
+        if is_write:
+            has_write_scope = any("write" in s.lower() for s in self.ctx.scopes)
+            if not has_write_scope:
+                return self.deny(cmd, reason="authorize: scope wiki.write required for write commands")
+
+        # ------------------------------------------------------------------
+        # JOB 4 — BUDGET: Protect credit pool against expensive field masks / catalog traps
+        if is_catalog_trap(new_server, new_tool, new_fields):
+            if new_server == "registry" and new_tool == "list_servers":
+                new_fields = ("name",)
+            elif new_server == "glossary" and new_tool == "list_terms":
+                new_fields = ("term",)
+            else:
+                new_fields = ("name",)
+            is_rewritten = True
+        elif new_fields == ("*",):
+            if new_tool == "get_frame":
+                new_fields = ("body", "title")
+            else:
+                new_fields = ("name", "title")
+            is_rewritten = True
+
+        routed = Command(
+            cmd_id=cmd.cmd_id,
+            kind=cmd.kind,
+            raw=cmd.raw,
+            server=new_server,
+            tool=new_tool,
+            args=cmd.args,
+            fields=new_fields,
+            headers=new_headers,
+            lease_id=cmd.lease_id,
+            call_index=cmd.call_index,
+        )
 
         call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
+        verdict = "rewrite" if is_rewritten else "forward"
+        decision = Decision(verdict=verdict, call=call)
         self._telemetry.decision_made(cmd, decision)
         return decision
 
@@ -545,7 +591,7 @@ if __name__ == "__main__":
     for cmd in demo_commands:
         decision = gw.decide(cmd)
         print(f"  decide({cmd.server}.{cmd.tool}) -> verdict={decision.verdict!r} quarantine={decision.quarantine}")
-        assert decision.verdict == "forward"
+        assert decision.verdict in ("forward", "rewrite")
         assert decision.call is not None
         call_dict = decision.call.to_dict() if hasattr(decision.call, "to_dict") else decision.call
         assert call_dict["server"] == cmd.server
